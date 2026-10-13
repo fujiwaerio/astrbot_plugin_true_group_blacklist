@@ -1,0 +1,7 @@
+name: astrbot_plugin_true_group_blacklist
+display_name: 真正的群黑名单
+desc: 在全局事件队列入口丢弃黑名单群事件，不进入内置指令、插件处理和 AI 回复流程；管理员不豁免。
+version: v1.0.0
+author: fujiwaerio
+repo: https://github.com/fujiwaerio/astrbot_plugin_true_group_blacklist
+astrbot_version: ">=4.28.1,<5"

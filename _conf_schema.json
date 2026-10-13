@@ -1,0 +1,15 @@
+{
+  "enabled": {
+    "description": "启用真正的群黑名单",
+    "type": "bool",
+    "default": true,
+    "hint": "全局事件入口拦截。保存配置后重载插件；管理员也不豁免。"
+  },
+  "blocked_groups": {
+    "description": "群黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "每项填一个群ID，例如123456789；指定某个机器人连接时填 平台实例ID|群ID。不要填群名、QQ用户ID或带发送者后缀的会话ID。保存后重载插件。",
+    "obvious_hint": true
+  }
+}
