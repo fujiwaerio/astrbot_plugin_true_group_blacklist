@@ -15,23 +15,59 @@ def normalize_id(value: Any) -> str:
 
 
 class GroupRules:
-    def __init__(self, entries: list, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        entries: list,
+        enabled: bool = True,
+        *,
+        mode: str = "blacklist",
+        allowed_groups: list | None = None,
+    ) -> None:
         if not isinstance(entries, list) or not isinstance(enabled, bool):
             raise ValueError("enabled 必须是布尔值，blocked_groups 必须是列表")
+        if mode not in ("blacklist", "whitelist"):
+            raise ValueError("mode 必须是 blacklist 或 whitelist")
         self.enabled = enabled
-        self.global_ids: set[str] = set()
-        self.scoped_ids: set[tuple[str, str]] = set()
+        self.mode = mode
+        self.global_ids, self.scoped_ids = self._parse(entries, "黑名单")
+        self.allowed_ids, self.allowed_scoped_ids = self._parse(
+            [] if allowed_groups is None else allowed_groups, "白名单"
+        )
+
+    @staticmethod
+    def _parse(entries: list, label: str) -> tuple[set[str], set[tuple[str, str]]]:
+        if not isinstance(entries, list):
+            raise ValueError(f"{label}必须是列表")
+        global_ids: set[str] = set()
+        scoped_ids: set[tuple[str, str]] = set()
         for entry in entries:
             rule = normalize_id(entry)
             if not rule or any(c.isspace() for c in rule):
-                raise ValueError("黑名单每项必须是非空群 ID 或 平台实例ID|群ID，不可包含空白")
+                raise ValueError(
+                    f"{label}每项必须是非空群 ID 或 平台实例ID|群ID，不可包含空白"
+                )
             if "|" in rule:
                 parts = rule.split("|")
                 if len(parts) != 2 or not all(parts):
-                    raise ValueError("定向黑名单格式应为 平台实例ID|群ID")
-                self.scoped_ids.add((parts[0], parts[1]))
+                    raise ValueError(f"定向{label}格式应为 平台实例ID|群ID")
+                scoped_ids.add((parts[0], parts[1]))
             else:
-                self.global_ids.add(rule)
+                global_ids.add(rule)
+        return global_ids, scoped_ids
+
+    def blocks_group(self, group_id: Any, platform_id: Any = "") -> bool:
+        """Use the same policy at both ingress points; private events pass."""
+        group = normalize_id(group_id)
+        if not self.enabled or not group:
+            return False
+        scoped = (normalize_id(platform_id), group)
+        if self.mode == "whitelist":
+            # An empty whitelist blocks every known group only in this mode.
+            # The blacklist is inactive, including entries present in both lists.
+            return (
+                group not in self.allowed_ids and scoped not in self.allowed_scoped_ids
+            )
+        return group in self.global_ids or scoped in self.scoped_ids
 
     def matches(self, event: Any) -> bool:
         if not self.enabled:
@@ -48,11 +84,61 @@ class GroupRules:
         if isinstance(raw, Mapping):
             ids.add(normalize_id(raw.get("group_id")))
         ids.discard("")
-        if ids & self.global_ids:
+        if self.mode == "blacklist" and ids & self.global_ids:
             return True
+        if not ids or (self.mode == "whitelist" and ids <= self.allowed_ids):
+            return False
         get_platform = getattr(event, "get_platform_id", None)
         platform = normalize_id(get_platform()) if callable(get_platform) else ""
-        return any((platform, group) in self.scoped_ids for group in ids)
+        return any(self.blocks_group(group, platform) for group in ids)
+
+
+class OneBotGuard:
+    """Filter the SDK bus before ANY notice/message subscriber can run."""
+
+    def __init__(self, bus: Any, platform_id: str, rules: GroupRules, logger: Any):
+        if not callable(getattr(bus, "emit", None)):
+            raise RuntimeError("不兼容的 OneBot SDK：缺少事件分发接口")
+        self.bus = bus
+        self.platform_id = normalize_id(platform_id)
+        self.rules = rules
+        self.active = False
+        self.blocked_count = 0
+        self._installed = False
+        self._original = bus.emit
+        self._existed = "emit" in vars(bus)
+        self._previous = vars(bus).get("emit")
+
+        async def emit(event_name, *args, **kwargs):
+            # OneBot Event is a dict. Ignore non-inbound bus events safely.
+            payload = args[0] if args else kwargs.get("event")
+            if (
+                self.active
+                and isinstance(payload, Mapping)
+                and rules.blocks_group(payload.get("group_id"), self.platform_id)
+            ):
+                self.blocked_count += 1
+                # SDK emit returns a list of handler results; [] also
+                # prevents quick-operation replies from dropped notices.
+                return []
+            return await self._original(event_name, *args, **kwargs)
+
+        self._emit = emit
+
+    def install(self):
+        if not self._installed:
+            self.bus.emit = self._emit
+            self.active = True
+            self._installed = True
+
+    def uninstall(self):
+        self.active = False
+        if self._installed and self.bus.emit is self._emit:
+            if self._existed:
+                self.bus.emit = self._previous
+            else:
+                delattr(self.bus, "emit")
+        self._installed = False
 
 
 class QueueGuard:
@@ -64,7 +150,9 @@ class QueueGuard:
 
     def __init__(self, queue: asyncio.Queue, rules: GroupRules, logger: Any) -> None:
         if not isinstance(queue, asyncio.Queue):
-            raise RuntimeError("不兼容的 AstrBot：Context._event_queue 不是 asyncio.Queue")
+            raise RuntimeError(
+                "不兼容的 AstrBot：Context._event_queue 不是 asyncio.Queue"
+            )
         self.queue = queue
         self.rules = rules
         self.logger = logger
@@ -75,7 +163,8 @@ class QueueGuard:
         self._original_put = queue.put
         self._original_nowait = queue.put_nowait
         self._saved_attrs = {
-            name: (name in vars(queue), vars(queue).get(name)) for name in ("put", "put_nowait")
+            name: (name in vars(queue), vars(queue).get(name))
+            for name in ("put", "put_nowait")
         }
 
         def put_nowait(item: Any) -> Any:

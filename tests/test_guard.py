@@ -51,7 +51,9 @@ class RulesTests(unittest.TestCase):
     def test_raw_group_notice_and_request(self):
         rules = GroupRules(["123"])
         for kind in ("notice", "request"):
-            self.assertTrue(rules.matches(Event("", raw={"post_type": kind, "group_id": 123})))
+            self.assertTrue(
+                rules.matches(Event("", raw={"post_type": kind, "group_id": 123}))
+            )
 
     def test_text_sender_and_private_not_inspected(self):
         rules = GroupRules(["123"])
@@ -74,7 +76,9 @@ class RulesTests(unittest.TestCase):
 class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.queue = asyncio.Queue()
-        self.guard = QueueGuard(self.queue, GroupRules(["123"]), logging.getLogger("test"))
+        self.guard = QueueGuard(
+            self.queue, GroupRules(["123"]), logging.getLogger("test")
+        )
         self.guard.install()
 
     async def asyncTearDown(self):
@@ -182,6 +186,132 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_wrong_queue_fails_visibly(self):
         with self.assertRaises(RuntimeError):
             QueueGuard(object(), GroupRules([]), logging.getLogger("test"))
+
+
+class WhitelistRulesTests(unittest.TestCase):
+    def test_only_exact_whitelisted_groups_pass(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=[123, " -100456 "])
+        for group in (123, "123", "-100456"):
+            self.assertFalse(rules.matches(Event(group)))
+        for group in ("456", "1234", "12", "0123"):
+            self.assertTrue(rules.matches(Event(group)))
+
+    def test_scope_only_exempts_selected_platform(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=["qq1|123"])
+        self.assertFalse(rules.matches(Event("123", "qq1")))
+        self.assertTrue(rules.matches(Event("123", "qq2")))
+        self.assertTrue(rules.matches(Event("123", "")))
+        self.assertTrue(rules.matches(Event("456", "qq1")))
+
+    def test_global_id_exempts_all_platforms(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=["123"])
+        for platform in ("qq1", "qq2", ""):
+            self.assertFalse(rules.matches(Event("123", platform)))
+
+    def test_empty_whitelist_blocks_all_known_groups(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=[])
+        self.assertTrue(rules.matches(Event("123")))
+        self.assertTrue(rules.matches(Event("456")))
+        self.assertFalse(rules.matches(Event("")))
+
+    def test_blacklist_is_inactive_in_whitelist_mode(self):
+        rules = GroupRules(["123"], mode="whitelist", allowed_groups=["123"])
+        self.assertFalse(rules.matches(Event("123")))
+        self.assertTrue(rules.matches(Event("456")))
+
+    def test_whitelist_is_inactive_in_default_blacklist_mode(self):
+        rules = GroupRules(["123"], allowed_groups=["123"])
+        self.assertTrue(rules.matches(Event("123")))
+        self.assertFalse(rules.matches(Event("456")))
+
+    def test_disabled_whitelist_passes_all_groups(self):
+        rules = GroupRules([], False, mode="whitelist", allowed_groups=["123"])
+        for group in ("123", "456", ""):
+            self.assertFalse(rules.matches(Event(group)))
+
+    def test_raw_notice_and_request_apply_the_same_policy(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=["123"])
+        for kind in ("notice", "request"):
+            self.assertFalse(
+                rules.matches(Event("", raw={"post_type": kind, "group_id": 123}))
+            )
+            self.assertTrue(
+                rules.matches(Event("", raw={"post_type": kind, "group_id": 456}))
+            )
+
+    def test_private_text_user_ids_and_unrecognized_events_pass(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=["123"])
+        self.assertFalse(rules.matches(Event("", text="group 456")))
+        self.assertFalse(rules.matches(Event("", raw={"user_id": 456})))
+        for group in ("", None, True, {}):
+            self.assertFalse(rules.matches(Event(group)))
+        self.assertFalse(rules.matches(object()))
+
+    def test_conflicting_structured_ids_do_not_exempt_other_groups(self):
+        rules = GroupRules([], mode="whitelist", allowed_groups=["123"])
+        self.assertTrue(rules.matches(Event("123", raw={"group_id": 456})))
+        self.assertTrue(rules.matches(Event("456", raw={"group_id": 123})))
+
+    def test_invalid_configuration_fails_before_installing(self):
+        for entries in ("123", {}, [True], [None], [""], ["a||b"], ["a|"], ["a b"]):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                GroupRules([], mode="whitelist", allowed_groups=entries)
+        for mode in ("", "allowlist", None, True, []):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                GroupRules([], mode=mode)
+
+
+class WhitelistQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_both_put_methods_pass_only_whitelist_and_private(self):
+        queue = asyncio.Queue()
+        guard = QueueGuard(
+            queue,
+            GroupRules(["123"], mode="whitelist", allowed_groups=["123"]),
+            logging.getLogger("test"),
+        )
+        guard.install()
+        try:
+            allowed, private = Event("123"), Event("")
+            queue.put_nowait(allowed)
+            await queue.put(private)
+            for text in ("hi", "/help", "/draw x", "@bot", "[image]", ""):
+                for put in (queue.put_nowait, queue.put):
+                    blocked = Event("456", text=text)
+                    result = put(blocked)
+                    if result is not None:
+                        await result
+                    self.assertEqual(blocked.cleaned, 1)
+            self.assertEqual(guard.blocked_count, 12)
+            self.assertIs(await queue.get(), allowed)
+            queue.task_done()
+            self.assertIs(await queue.get(), private)
+            queue.task_done()
+            self.assertEqual(allowed.cleaned, 0)
+            self.assertEqual(private.cleaned, 0)
+            await asyncio.wait_for(queue.join(), 1)
+        finally:
+            guard.uninstall()
+        queue.put_nowait(Event("456"))
+        self.assertEqual(queue.qsize(), 1)
+
+    async def test_full_queue_drops_other_groups_without_waiting(self):
+        queue = asyncio.Queue(maxsize=1)
+        guard = QueueGuard(
+            queue,
+            GroupRules([], mode="whitelist", allowed_groups=["123"]),
+            logging.getLogger("test"),
+        )
+        guard.install()
+        try:
+            queue.put_nowait(Event("123"))
+            queue.put_nowait(Event("456"))
+            await asyncio.wait_for(queue.put(Event("456")), 1)
+            with self.assertRaises(asyncio.QueueFull):
+                queue.put_nowait(Event("123"))
+            self.assertEqual(queue.qsize(), 1)
+            self.assertEqual(guard.blocked_count, 2)
+        finally:
+            guard.uninstall()
 
 
 if __name__ == "__main__":

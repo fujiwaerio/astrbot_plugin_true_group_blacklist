@@ -5,11 +5,27 @@
     "default": true,
     "hint": "全局事件入口拦截。保存配置后重载插件；管理员也不豁免。"
   },
+  "mode": {
+    "description": "群拦截模式",
+    "type": "string",
+    "default": "blacklist",
+    "options": ["blacklist", "whitelist"],
+    "labels": ["黑名单：仅拦截指定群", "白名单：指定群放行，其余群全部拦截"],
+    "hint": "blacklist 保留原有行为；whitelist 仅放行群白名单中的群，其他可识别的群全部拦截，普通私聊不受影响。白名单模式下不读取黑名单规则；白名单为空会拦截所有群。保存后重载插件。",
+    "obvious_hint": true
+  },
+  "allowed_groups": {
+    "description": "群白名单（白名单模式下放行的群）",
+    "type": "list",
+    "default": [],
+    "hint": "先将群拦截模式设为 whitelist。每项填写群ID，或 平台实例ID|群ID；仅指定群不执行本插件的入站拦截，其余群全部拦截。只想放行一个群时，仅添加一项。普通私聊不受影响。",
+    "obvious_hint": true
+  },
   "blocked_groups": {
     "description": "群黑名单",
     "type": "list",
     "default": [],
-    "hint": "每项填一个群ID，例如123456789；指定某个机器人连接时填 平台实例ID|群ID。不要填群名、QQ用户ID或带发送者后缀的会话ID。保存后重载插件。",
+    "hint": "仅在 blacklist 模式生效。每项填一个群ID，例如123456789；指定某个机器人连接时填 平台实例ID|群ID。不要填群名、QQ用户ID或带发送者后缀的会话ID。保存后重载插件。",
     "obvious_hint": true
   }
 }
